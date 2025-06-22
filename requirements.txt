@@ -1,0 +1,16 @@
+# FastAPI Backend Requirements
+fastapi
+uvicorn[standard]
+requests
+beautifulsoup4
+google-generativeai
+pydantic
+python-multipart
+
+# Streamlit Frontend Requirements
+streamlit
+pandas
+
+# Additional utilities
+python-dotenv
+lxml
