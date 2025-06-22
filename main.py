@@ -1,13 +1,15 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl
 import requests
 from bs4 import BeautifulSoup
 import google.generativeai as genai
-from typing import List
+from typing import List, Optional
 import os
 from urllib.parse import urljoin, urlparse
 import re
+import asyncio
+import time
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -28,12 +30,17 @@ model = genai.GenerativeModel('gemini-2.0-flash')
 
 class URLRequest(BaseModel):
     url: HttpUrl
+    timeout: Optional[int] = 30  # Allow client to specify timeout
 
 class XPathResponse(BaseModel):
     url: str
     xpaths: List[str]
     html_content: str
     status: str
+    processing_time: float
+
+# Store for async processing
+processing_results = {}
 
 def clean_html(html_content: str) -> str:
     """Clean and minimize HTML content for better processing"""
@@ -42,6 +49,10 @@ def clean_html(html_content: str) -> str:
     # Remove script and style elements
     for script in soup(["script", "style"]):
         script.decompose()
+    
+    # Remove comments
+    for comment in soup.find_all(string=lambda text: isinstance(text, str) and text.strip().startswith('<!--')):
+        comment.extract()
     
     # Get text and clean it
     text = soup.get_text()
@@ -52,60 +63,70 @@ def clean_html(html_content: str) -> str:
     return str(soup)
 
 def extract_html_from_url(url: str) -> str:
-    """Extract HTML content from given URL"""
+    """Extract HTML content from given URL with optimized settings"""
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
     }
     
     try:
-        response = requests.get(url, headers=headers, timeout=10)
+        # Reduced timeout for URL fetching
+        response = requests.get(url, headers=headers, timeout=8)
         response.raise_for_status()
         return response.text
     except requests.RequestException as e:
         raise HTTPException(status_code=400, detail=f"Failed to fetch URL: {str(e)}")
 
-def get_xpaths_from_gemini(html_content: str, url: str) -> List[str]:
-    """Use Gemini API to extract XPaths from HTML content"""
+async def get_xpaths_from_gemini_async(html_content: str, url: str) -> List[str]:
+    """Async wrapper for Gemini API call with timeout"""
     
-    # Truncate HTML if too long (Gemini has token limits)
-    if len(html_content) > 50000:
-        html_content = html_content[:50000] + "..."
+    def _sync_gemini_call():
+        # Reduce HTML content more aggressively for faster processing
+        if len(html_content) > 30000:
+            html_content_truncated = html_content[:30000] + "..."
+        else:
+            html_content_truncated = html_content
+        
+        prompt = f"""
+        Analyze this HTML from {url} and extract the most important XPaths.
+        
+        Focus on these priority elements:
+        1. Form inputs (input, button, textarea, select)
+        2. Navigation links (a, nav elements)
+        3. Main content containers (main, article, section)
+        4. Interactive elements (buttons, clickable divs)
+        
+        Provide concise, practical XPaths only. Maximum 20 XPaths.
+        
+        HTML Content:
+        {html_content_truncated}
+        
+        Return only XPaths, one per line:
+        """
+        
+        try:
+            response = model.generate_content(prompt)
+            return response.text
+        except Exception as e:
+            raise Exception(f"Gemini API error: {str(e)}")
     
-    prompt = f"""
-    Analyze the following HTML content from the website: {url}
-    
-    Please extract ALL possible XPaths for various elements in this HTML. Focus on:
-    1. All form elements (inputs, buttons, textareas, selects)
-    2. All clickable elements (buttons, links, clickable divs)
-    3. All text elements (headings, paragraphs, spans)
-    4. All navigation elements
-    5. All containers and divs with meaningful content
-    6. All images and media elements
-    7. All table elements if present
-    8. All list elements
-    
-    For each element, provide the most specific and reliable XPath. Include both absolute and relative XPaths when useful.
-    
-    HTML Content:
-    {html_content}
-    
-    Please respond with ONLY the XPaths, one per line, without any additional text or explanations. Format each XPath clearly.
-    """
-    
+    # Run the sync function in a thread pool with timeout
     try:
-        response = model.generate_content(prompt)
-        xpaths_text = response.text
+        loop = asyncio.get_event_loop()
+        # 25 second timeout for Gemini API
+        xpaths_text = await asyncio.wait_for(
+            loop.run_in_executor(None, _sync_gemini_call), 
+            timeout=25.0
+        )
         
         # Parse XPaths from response
         xpath_lines = [line.strip() for line in xpaths_text.split('\n') if line.strip()]
         
-        # Filter valid XPaths (should start with / or // or contain xpath syntax)
+        # Filter valid XPaths
         valid_xpaths = []
         for line in xpath_lines:
-            # Remove any markdown formatting or numbering
-            cleaned_line = re.sub(r'^\d+\.\s*', '', line)  # Remove numbering
-            cleaned_line = re.sub(r'^[-*]\s*', '', cleaned_line)  # Remove bullet points
-            cleaned_line = cleaned_line.strip('`')  # Remove backticks
+            cleaned_line = re.sub(r'^\d+\.\s*', '', line)
+            cleaned_line = re.sub(r'^[-*]\s*', '', cleaned_line)
+            cleaned_line = cleaned_line.strip('`')
             
             if (cleaned_line.startswith('/') or 
                 cleaned_line.startswith('//') or 
@@ -115,6 +136,8 @@ def get_xpaths_from_gemini(html_content: str, url: str) -> List[str]:
         
         return valid_xpaths if valid_xpaths else ["//body", "//html"]
         
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=408, detail="AI processing timed out. Try with a simpler page.")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Gemini API error: {str(e)}")
 
@@ -124,36 +147,101 @@ async def root():
 
 @app.post("/extract-xpaths", response_model=XPathResponse)
 async def extract_xpaths(request: URLRequest):
-    """Extract XPaths from a given URL"""
+    """Extract XPaths from a given URL with timeout handling"""
     
     url = str(request.url)
+    start_time = time.time()
     
     try:
-        # Step 1: Extract HTML from URL
+        # Step 1: Extract HTML from URL (quick)
         html_content = extract_html_from_url(url)
         
-        # Step 2: Clean HTML for better processing
+        # Step 2: Clean HTML for better processing (quick)
         cleaned_html = clean_html(html_content)
         
-        # Step 3: Get XPaths from Gemini
-        xpaths = get_xpaths_from_gemini(cleaned_html, url)
+        # Step 3: Get XPaths from Gemini with timeout
+        xpaths = await get_xpaths_from_gemini_async(cleaned_html, url)
+        
+        processing_time = time.time() - start_time
         
         return XPathResponse(
             url=url,
             xpaths=xpaths,
-            html_content=cleaned_html[:5000] + "..." if len(cleaned_html) > 5000 else cleaned_html,
-            status="success"
+            html_content=cleaned_html[:3000] + "..." if len(cleaned_html) > 3000 else cleaned_html,
+            status="success",
+            processing_time=round(processing_time, 2)
         )
         
     except HTTPException:
         raise
     except Exception as e:
+        processing_time = time.time() - start_time
+        print(f"Error after {processing_time:.2f}s: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+@app.post("/extract-xpaths-fast")
+async def extract_xpaths_fast(request: URLRequest):
+    """Fast extraction with basic XPaths - no AI processing"""
+    
+    url = str(request.url)
+    start_time = time.time()
+    
+    try:
+        html_content = extract_html_from_url(url)
+        soup = BeautifulSoup(html_content, 'html.parser')
+        
+        # Extract basic XPaths using BeautifulSoup
+        xpaths = []
+        
+        # Common form elements
+        for tag in ['input', 'button', 'textarea', 'select']:
+            elements = soup.find_all(tag)
+            for i, elem in enumerate(elements):
+                if elem.get('id'):
+                    xpaths.append(f"//{tag}[@id='{elem['id']}']")
+                elif elem.get('name'):
+                    xpaths.append(f"//{tag}[@name='{elem['name']}']")
+                else:
+                    xpaths.append(f"(//{tag})[{i+1}]")
+        
+        # Links
+        links = soup.find_all('a', href=True)
+        for i, link in enumerate(links):
+            if link.get('id'):
+                xpaths.append(f"//a[@id='{link['id']}']")
+            else:
+                xpaths.append(f"(//a)[{i+1}]")
+        
+        # Headers
+        for tag in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
+            headers = soup.find_all(tag)
+            for i, header in enumerate(headers):
+                xpaths.append(f"(//{tag})[{i+1}]")
+        
+        processing_time = time.time() - start_time
+        
+        return XPathResponse(
+            url=url,
+            xpaths=xpaths[:50],  # Limit results
+            html_content=html_content[:3000] + "..." if len(html_content) > 3000 else html_content,
+            status="success",
+            processing_time=round(processing_time, 2)
+        )
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
 @app.get("/health")
 async def health_check():
     return {"status": "healthy", "service": "xpath-extractor"}
 
+# Add timeout configuration for uvicorn
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(
+        app, 
+        host="0.0.0.0", 
+        port=8000,
+        timeout_keep_alive=60,  # Keep connections alive longer
+        timeout_graceful_shutdown=30
+    )
