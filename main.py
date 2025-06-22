@@ -4,16 +4,19 @@ from pydantic import BaseModel, HttpUrl
 import requests
 from bs4 import BeautifulSoup
 import google.generativeai as genai
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 import os
 from urllib.parse import urljoin, urlparse
 import re
 import asyncio
 import time
 from dotenv import load_dotenv
+import hashlib
+import json
+
 load_dotenv()
 
-app = FastAPI(title="XPath Extractor API", version="1.0.0")
+app = FastAPI(title="Website Chat API", version="1.0.0")
 
 # Add CORS middleware
 app.add_middleware(
@@ -28,146 +31,189 @@ app.add_middleware(
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 model = genai.GenerativeModel('gemini-2.0-flash')
 
+# In-memory storage for website content and chat history
+website_cache = {}
+chat_sessions = {}
+
 class URLRequest(BaseModel):
     url: HttpUrl
-    timeout: Optional[int] = 30  # Allow client to specify timeout
 
-class XPathResponse(BaseModel):
+class ChatRequest(BaseModel):
+    session_id: str
+    message: str
+
+class WebsiteResponse(BaseModel):
+    session_id: str
     url: str
-    xpaths: List[str]
-    html_content: str
+    title: str
+    content_preview: str
+    word_count: int
     status: str
     processing_time: float
 
-# Store for async processing
-processing_results = {}
+class ChatResponse(BaseModel):
+    session_id: str
+    user_message: str
+    ai_response: str
+    timestamp: float
 
-def clean_html(html_content: str) -> str:
-    """Clean and minimize HTML content for better processing"""
+class ChatHistoryResponse(BaseModel):
+    session_id: str
+    history: List[Dict[str, Any]]
+    website_info: Dict[str, Any]
+
+def generate_session_id(url: str) -> str:
+    """Generate a unique session ID based on URL and timestamp"""
+    unique_string = f"{url}_{int(time.time())}"
+    return hashlib.md5(unique_string.encode()).hexdigest()[:12]
+
+def clean_and_extract_text(html_content: str) -> tuple[str, str]:
+    """Extract clean text and title from HTML"""
     soup = BeautifulSoup(html_content, 'html.parser')
     
-    # Remove script and style elements
-    for script in soup(["script", "style"]):
-        script.decompose()
+    # Extract title
+    title_tag = soup.find('title')
+    title = title_tag.get_text().strip() if title_tag else "Untitled Page"
+    
+    # Remove script, style, and other non-content elements
+    for element in soup(["script", "style", "nav", "header", "footer", "aside", "noscript"]):
+        element.decompose()
     
     # Remove comments
     for comment in soup.find_all(string=lambda text: isinstance(text, str) and text.strip().startswith('<!--')):
         comment.extract()
     
-    # Get text and clean it
-    text = soup.get_text()
+    # Extract main content areas preferentially
+    main_content = soup.find('main') or soup.find('article') or soup.find('div', class_=re.compile(r'content|main|body'))
+    
+    if main_content:
+        text = main_content.get_text()
+    else:
+        text = soup.get_text()
+    
+    # Clean the text
     lines = (line.strip() for line in text.splitlines())
     chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
-    text = ' '.join(chunk for chunk in chunks if chunk)
+    clean_text = ' '.join(chunk for chunk in chunks if chunk)
     
-    return str(soup)
+    # Remove excessive whitespace
+    clean_text = re.sub(r'\s+', ' ', clean_text).strip()
+    
+    return clean_text, title
 
-def extract_html_from_url(url: str) -> str:
-    """Extract HTML content from given URL with optimized settings"""
+def extract_website_content(url: str) -> tuple[str, str]:
+    """Extract content from website URL"""
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
     }
     
     try:
-        # Reduced timeout for URL fetching
-        response = requests.get(url, headers=headers, timeout=8)
+        response = requests.get(url, headers=headers, timeout=10)
         response.raise_for_status()
-        return response.text
+        
+        content, title = clean_and_extract_text(response.text)
+        return content, title
+        
     except requests.RequestException as e:
         raise HTTPException(status_code=400, detail=f"Failed to fetch URL: {str(e)}")
 
-async def get_xpaths_from_gemini_async(html_content: str, url: str) -> List[str]:
-    """Async wrapper for Gemini API call with timeout"""
+async def get_ai_response(message: str, website_content: str, chat_history: List[Dict]) -> str:
+    """Get AI response based on user message, website content, and chat history"""
     
-    def _sync_gemini_call():
-        # Reduce HTML content more aggressively for faster processing
-        if len(html_content) > 30000:
-            html_content_truncated = html_content[:30000] + "..."
+    def _sync_ai_call():
+        # Build context from chat history
+        history_context = ""
+        if chat_history:
+            recent_history = chat_history[-5:]  # Last 5 exchanges
+            for chat in recent_history:
+                history_context += f"User: {chat['user_message']}\nAI: {chat['ai_response']}\n\n"
+        
+        # Limit website content for better processing
+        content_limit = 15000
+        if len(website_content) > content_limit:
+            website_content_truncated = website_content[:content_limit] + "... [content truncated]"
         else:
-            html_content_truncated = html_content
+            website_content_truncated = website_content
         
         prompt = f"""
-        Analyze this HTML from {url} and extract the most important XPaths.
+        You are a helpful AI assistant that can answer questions about website content. 
         
-        Focus on these priority elements:
-        1. Form inputs (input, button, textarea, select)
-        2. Navigation links (a, nav elements)
-        3. Main content containers (main, article, section)
-        4. Interactive elements (buttons, clickable divs)
+        Website Content:
+        {website_content_truncated}
         
-        Provide concise, practical XPaths only. Maximum 20 XPaths.
+        Previous Conversation:
+        {history_context}
         
-        HTML Content:
-        {html_content_truncated}
+        User's Current Question: {message}
         
-        Return only XPaths, one per line:
+        Instructions:
+        - Answer based on the website content provided
+        - If the question is about summarization, provide a clear and concise summary
+        - If asked specific questions, find relevant information from the content
+        - If the information isn't in the content, politely say so
+        - Keep responses conversational and helpful
+        - Reference specific parts of the content when relevant
+        
+        Response:
         """
         
         try:
             response = model.generate_content(prompt)
             return response.text
         except Exception as e:
-            raise Exception(f"Gemini API error: {str(e)}")
+            raise Exception(f"AI API error: {str(e)}")
     
-    # Run the sync function in a thread pool with timeout
     try:
         loop = asyncio.get_event_loop()
-        # 25 second timeout for Gemini API
-        xpaths_text = await asyncio.wait_for(
-            loop.run_in_executor(None, _sync_gemini_call), 
-            timeout=25.0
+        ai_response = await asyncio.wait_for(
+            loop.run_in_executor(None, _sync_ai_call), 
+            timeout=30.0
         )
-        
-        # Parse XPaths from response
-        xpath_lines = [line.strip() for line in xpaths_text.split('\n') if line.strip()]
-        
-        # Filter valid XPaths
-        valid_xpaths = []
-        for line in xpath_lines:
-            cleaned_line = re.sub(r'^\d+\.\s*', '', line)
-            cleaned_line = re.sub(r'^[-*]\s*', '', cleaned_line)
-            cleaned_line = cleaned_line.strip('`')
-            
-            if (cleaned_line.startswith('/') or 
-                cleaned_line.startswith('//') or 
-                'xpath' in cleaned_line.lower() or
-                cleaned_line.startswith('.')):
-                valid_xpaths.append(cleaned_line)
-        
-        return valid_xpaths if valid_xpaths else ["//body", "//html"]
+        return ai_response
         
     except asyncio.TimeoutError:
-        raise HTTPException(status_code=408, detail="AI processing timed out. Try with a simpler page.")
+        raise HTTPException(status_code=408, detail="AI processing timed out. Please try again.")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Gemini API error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"AI error: {str(e)}")
 
 @app.get("/")
 async def root():
-    return {"message": "XPath Extractor API is running"}
+    return {"message": "Website Chat API is running"}
 
-@app.post("/extract-xpaths", response_model=XPathResponse)
-async def extract_xpaths(request: URLRequest):
-    """Extract XPaths from a given URL with timeout handling"""
+@app.post("/extract-website", response_model=WebsiteResponse)
+async def extract_website(request: URLRequest):
+    """Extract and process website content"""
     
     url = str(request.url)
     start_time = time.time()
     
     try:
-        # Step 1: Extract HTML from URL (quick)
-        html_content = extract_html_from_url(url)
+        # Extract content from website
+        content, title = extract_website_content(url)
         
-        # Step 2: Clean HTML for better processing (quick)
-        cleaned_html = clean_html(html_content)
+        # Generate session ID
+        session_id = generate_session_id(url)
         
-        # Step 3: Get XPaths from Gemini with timeout
-        xpaths = await get_xpaths_from_gemini_async(cleaned_html, url)
+        # Store in cache
+        website_cache[session_id] = {
+            "url": url,
+            "title": title,
+            "content": content,
+            "timestamp": time.time()
+        }
+        
+        # Initialize chat session
+        chat_sessions[session_id] = []
         
         processing_time = time.time() - start_time
+        word_count = len(content.split())
         
-        return XPathResponse(
+        return WebsiteResponse(
+            session_id=session_id,
             url=url,
-            xpaths=xpaths,
-            html_content=cleaned_html[:3000] + "..." if len(cleaned_html) > 3000 else cleaned_html,
+            title=title,
+            content_preview=content[:500] + "..." if len(content) > 500 else content,
+            word_count=word_count,
             status="success",
             processing_time=round(processing_time, 2)
         )
@@ -176,72 +222,96 @@ async def extract_xpaths(request: URLRequest):
         raise
     except Exception as e:
         processing_time = time.time() - start_time
-        print(f"Error after {processing_time:.2f}s: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
-@app.post("/extract-xpaths-fast")
-async def extract_xpaths_fast(request: URLRequest):
-    """Fast extraction with basic XPaths - no AI processing"""
+@app.post("/chat", response_model=ChatResponse)
+async def chat_with_content(request: ChatRequest):
+    """Chat with the extracted website content"""
     
-    url = str(request.url)
-    start_time = time.time()
+    # Check if session exists
+    if request.session_id not in website_cache:
+        raise HTTPException(status_code=404, detail="Session not found. Please extract website content first.")
+    
+    if request.session_id not in chat_sessions:
+        chat_sessions[request.session_id] = []
     
     try:
-        html_content = extract_html_from_url(url)
-        soup = BeautifulSoup(html_content, 'html.parser')
+        website_data = website_cache[request.session_id]
+        chat_history = chat_sessions[request.session_id]
         
-        # Extract basic XPaths using BeautifulSoup
-        xpaths = []
-        
-        # Common form elements
-        for tag in ['input', 'button', 'textarea', 'select']:
-            elements = soup.find_all(tag)
-            for i, elem in enumerate(elements):
-                if elem.get('id'):
-                    xpaths.append(f"//{tag}[@id='{elem['id']}']")
-                elif elem.get('name'):
-                    xpaths.append(f"//{tag}[@name='{elem['name']}']")
-                else:
-                    xpaths.append(f"(//{tag})[{i+1}]")
-        
-        # Links
-        links = soup.find_all('a', href=True)
-        for i, link in enumerate(links):
-            if link.get('id'):
-                xpaths.append(f"//a[@id='{link['id']}']")
-            else:
-                xpaths.append(f"(//a)[{i+1}]")
-        
-        # Headers
-        for tag in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
-            headers = soup.find_all(tag)
-            for i, header in enumerate(headers):
-                xpaths.append(f"(//{tag})[{i+1}]")
-        
-        processing_time = time.time() - start_time
-        
-        return XPathResponse(
-            url=url,
-            xpaths=xpaths[:50],  # Limit results
-            html_content=html_content[:3000] + "..." if len(html_content) > 3000 else html_content,
-            status="success",
-            processing_time=round(processing_time, 2)
+        # Get AI response
+        ai_response = await get_ai_response(
+            request.message, 
+            website_data["content"], 
+            chat_history
         )
         
+        # Store chat exchange
+        chat_exchange = {
+            "user_message": request.message,
+            "ai_response": ai_response,
+            "timestamp": time.time()
+        }
+        
+        chat_sessions[request.session_id].append(chat_exchange)
+        
+        return ChatResponse(
+            session_id=request.session_id,
+            user_message=request.message,
+            ai_response=ai_response,
+            timestamp=chat_exchange["timestamp"]
+        )
+        
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Chat error: {str(e)}")
+
+@app.get("/chat-history/{session_id}", response_model=ChatHistoryResponse)
+async def get_chat_history(session_id: str):
+    """Get chat history for a session"""
+    
+    if session_id not in website_cache:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    
+    return ChatHistoryResponse(
+        session_id=session_id,
+        history=chat_sessions.get(session_id, []),
+        website_info={
+            "url": website_cache[session_id]["url"],
+            "title": website_cache[session_id]["title"],
+            "word_count": len(website_cache[session_id]["content"].split())
+        }
+    )
+
+@app.delete("/session/{session_id}")
+async def clear_session(session_id: str):
+    """Clear a chat session"""
+    
+    if session_id in website_cache:
+        del website_cache[session_id]
+    
+    if session_id in chat_sessions:
+        del chat_sessions[session_id]
+    
+    return {"message": "Session cleared successfully"}
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "service": "xpath-extractor"}
+    return {"status": "healthy", "service": "website-chat"}
 
-# Add timeout configuration for uvicorn
+# Cleanup old sessions (run periodically)
+@app.on_event("startup")
+async def startup_event():
+    """Clean up old sessions on startup"""
+    pass
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
         app, 
         host="0.0.0.0", 
         port=8000,
-        timeout_keep_alive=60,  # Keep connections alive longer
+        timeout_keep_alive=60,
         timeout_graceful_shutdown=30
     )
